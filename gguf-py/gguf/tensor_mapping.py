@@ -2661,6 +2661,26 @@ class TensorNameMap:
             "model.layers.{bid}.hnorm",
         ),
 
+        MODEL_TENSOR.NEXTN_FC_EMBD: (
+            "model.layers.{bid}.fc_embd_mtp",
+        ),
+
+        MODEL_TENSOR.NEXTN_FC_HIDDEN: (
+            "model.layers.{bid}.fc_hidden_mtp",
+        ),
+
+        MODEL_TENSOR.NEXTN_HC_NORM: (
+            "model.layers.{bid}.hc_mixer_mtp.hc_norm",
+        ),
+
+        MODEL_TENSOR.NEXTN_HC_DOWN: (
+            "model.layers.{bid}.hc_mixer_mtp.input_mix_weight_down",
+        ),
+
+        MODEL_TENSOR.NEXTN_HC_UP: (
+            "model.layers.{bid}.hc_mixer_mtp.input_mix_weight_up",
+        ),
+
         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD: (
             "model.layers.{bid}.shared_head.head",
         ),

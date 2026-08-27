@@ -2391,8 +2391,14 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
-    // note: for small models maybe we can set this to the maximum possible draft from all speculative types
-    //       the extra memory for small models is likely negligible?
+    // note: do NOT give the draft context a rollback ring (n_rs_seq > 0). the draft decodes
+    // one token per ubatch while drafting, and the delta-net snapshot store clamps banks
+    // older than the current ubatch to the batch-start state, so a rollback deeper than one
+    // token restores a state that is too new. the draft then drafts from a desynced prefix:
+    // measured on a qwen35 4B target + 2B draft pair, acceptance fell to 0.343 with the ring
+    // vs 0.84 with the (slower, serialize-per-step) FULL path, while outputs stayed exact
+    // because verification is target-authoritative. the target is unaffected: its rollbacks
+    // always land inside its own n_draft+1-token verify batch, whose banks are all fresh.
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
@@ -2401,7 +2407,10 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        // load the draft path that was just logged - loading params.model.path here loaded
+        // the main model a second time, which only worked by accident for models whose
+        // nextn tensors live inside the main GGUF, and never for mtp- sidecar files
+        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;

@@ -1661,7 +1661,14 @@ void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
 void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
     common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
     if (ctx_dft) {
-        common_context_seq_rm(ctx_dft, seq_id, p0, p1);
+        // mixed-capability pair: the target may support partial removal (e.g. via the
+        // recurrent rollback ring) while a recurrent draft model does not. the draft cache
+        // is a pure optimization, so instead of aborting, drop the whole draft sequence and
+        // let the driver re-prime it from the prompt on the next draft call.
+        auto * mem = llama_get_memory(ctx_dft);
+        if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
+            llama_memory_seq_rm(mem, seq_id, -1, -1);
+        }
     }
 }
 

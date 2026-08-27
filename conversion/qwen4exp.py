@@ -26,9 +26,9 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP block is a separate draft head; vLLM drops it too
-    supports_mtp_export = False
-    no_mtp = True
+    # the MTP block loads through the shared _QwenMtpMixin remap; the qwen4exp-specific
+    # glue (fc_embedding/fc_hidden and the head's hyper-connection mixer) is rewritten in
+    # filter_tensors below
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -39,6 +39,25 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self._ple_rows_per_shard: int | None = None
         self._ple_map: np.memmap | None = None
         self._ple_path: Path | None = None
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name = item[0]
+        if name.startswith("model.mtp."):
+            name = name.replace("model.", "", 1)
+            item = (name, item[1])
+        if name.startswith("mtp.") and not cls.no_mtp:
+            obc = cls._original_block_count
+            parts = name.split(".")
+            # separate embedding/hidden projections in place of qwen35's fused eh_proj
+            if len(parts) == 3 and parts[1] == "fc_embedding":
+                return f"model.layers.{obc}.fc_embd_mtp.weight", item[1]
+            if len(parts) == 3 and parts[1] == "fc_hidden":
+                return f"model.layers.{obc}.fc_hidden_mtp.weight", item[1]
+            # the head's own hyper-connection mixer in place of shared_head.norm
+            if len(parts) == 4 and parts[1] == "hyper_connection_mixer":
+                return f"model.layers.{obc}.hc_mixer_mtp.{parts[2]}.{parts[3]}", item[1]
+        return super().filter_tensors(item)
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -68,14 +87,17 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
-        self.gguf_writer.add_attention_compress_ratios(
-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
-        )
+        # the MTP block(s) beyond the trunk run dense: pad the per-layer array to block_count
+        ratios = [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+        ratios += [0] * (self.block_count - n_layer)
+        self.gguf_writer.add_attention_compress_ratios(ratios)
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
         # so emit no PLE keys rather than optional ones
         ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
-        if not ple_layers:
+        # an mtp- sidecar ships no n-gram table and its filter drops the PLE constants,
+        # so emit no PLE keys at all: the loader then treats the file as PLE-free
+        if not ple_layers or self.mtp_only:
             return
         self.gguf_writer.add_ple_layers(ple_layers)
         self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])

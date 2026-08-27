@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -3299,6 +3300,25 @@ private:
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
+                                // reusing a partial prefix requires removing the cached tail from every
+                                // attached context. a draft context that cannot partially remove its tail
+                                // would either abort or be cleared entirely, and the speculative driver
+                                // only mirrors new target batches into it, so a cleared draft never sees
+                                // the prompt again and drafts garbage. follow the weakest link: with such
+                                // a draft attached, reuse the whole cached prompt or nothing.
+                                if (ctx_dft && n_past > 0 && (size_t) n_past < slot.prompt.tokens.size()) {
+                                    const uint32_t trim = (uint32_t) (slot.prompt.tokens.size() - n_past);
+
+                                    const bool dft_can_trim =
+                                        ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                                        (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && trim <= llama_n_rs_seq(ctx_dft));
+
+                                    if (!dft_can_trim) {
+                                        SLT_INF(slot, "draft context cannot follow a partial prompt trim of %u tokens - dropping the prompt cache (n_past %d -> 0)\n", trim, n_past);
+                                        n_past = 0;
+                                    }
+                                }
+
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
@@ -4003,9 +4023,19 @@ private:
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
 
+                // the draft context may be unable to roll back even when the target can (e.g. a
+                // recurrent draft model without a rollback ring behind a ring-capable target).
+                // without restoring its checkpoint here, the draft is left permanently desynced
+                // after the first rejection (or aborted on the seq_rm below), so route such
+                // pairs through the checkpoint+replay path; the target itself still rolls back
+                // via its ring in the seq_rm, avoiding the expensive target state restore.
+                const bool use_ckpt_dft = slot.ctx_dft != nullptr &&
+                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                     (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(slot.ctx_dft)));
+
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
-                    if (use_ckpt_tgt) {
+                    if (use_ckpt_tgt || use_ckpt_dft) {
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
@@ -4018,9 +4048,11 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        if (use_ckpt_tgt) {
+                            ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        }
 
-                        if (slot.ctx_dft) {
+                        if (slot.ctx_dft && !ckpt.data_dft.empty()) {
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 

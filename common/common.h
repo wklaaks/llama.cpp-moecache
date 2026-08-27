@@ -385,11 +385,20 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
+        // every speculative type rolls back the target's rejected draft suffix, so any of
+        // them benefits from the recurrent-state snapshot ring on rollback-capable archs;
+        // without it, recurrent/hybrid models fall back to full per-step state
+        // serialization through host memory (SEQ_RM_TYPE_FULL), which is catastrophically
+        // slow (measured ~750 ms/step on qwen4exp)
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t != COMMON_SPECULATIVE_TYPE_NONE;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        // n_max + 1: a verify batch holds the previously sampled token plus up to n_max
+        // drafts, and the checkpoint+replay path (used when the draft context cannot roll
+        // back) rewinds the target across the whole batch, one deeper than the rejected
+        // draft suffix alone
+        return needs_rs_seq ? draft.n_max + 1 : 0u;
     }
 };
 
