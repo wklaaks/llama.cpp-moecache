@@ -438,6 +438,19 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+enum common_moe_cache_mode {
+    COMMON_MOE_CACHE_MODE_OFF,
+    COMMON_MOE_CACHE_MODE_AUTO,
+    COMMON_MOE_CACHE_MODE_ON,
+};
+
+struct common_moe_cache_params {
+    common_moe_cache_mode mode = COMMON_MOE_CACHE_MODE_AUTO;
+    size_t budget_mib          = 0;
+    bool mode_explicit         = false;
+    bool fit_selected          = false;
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -571,6 +584,7 @@ struct common_params {
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
+    common_moe_cache_params moe_cache;
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
     bool single_turn       = false; // single turn chat conversation

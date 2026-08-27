@@ -51,6 +51,180 @@ static common_speculative_output_limits server_output_limits(const common_params
     return result;
 }
 
+struct server_shared_draft_device_config {
+    bool prepared = false;
+    size_t n_weight_devices = 0;
+    std::vector<ggml_backend_dev_t> devices;
+    std::vector<float> tensor_split;
+};
+
+static std::vector<ggml_backend_dev_t> server_configured_devices(const common_params & params) {
+    std::vector<ggml_backend_dev_t> result;
+    if (!params.devices.empty()) {
+        for (ggml_backend_dev_t device : params.devices) {
+            if (device == nullptr) {
+                break;
+            }
+            result.push_back(device);
+        }
+        return result;
+    }
+
+    std::vector<ggml_backend_dev_t> rpc_devices;
+    std::vector<ggml_backend_dev_t> gpu_devices;
+    ggml_backend_dev_t igpu_device = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t device = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
+        if (type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            if (igpu_device == nullptr) {
+                igpu_device = device;
+            }
+            continue;
+        }
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        if (reg && std::string(ggml_backend_reg_name(reg)) == "RPC") {
+            rpc_devices.push_back(device);
+            continue;
+        }
+
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(device, &props);
+        const bool duplicate = std::any_of(gpu_devices.begin(), gpu_devices.end(), [&](ggml_backend_dev_t existing) {
+            ggml_backend_dev_props existing_props;
+            ggml_backend_dev_get_props(existing, &existing_props);
+            return props.device_id && existing_props.device_id &&
+                   std::string(props.device_id) == existing_props.device_id;
+        });
+        if (!duplicate) {
+            gpu_devices.push_back(device);
+        }
+    }
+
+    result.insert(result.end(), rpc_devices.begin(), rpc_devices.end());
+    result.insert(result.end(), gpu_devices.begin(), gpu_devices.end());
+    if (gpu_devices.empty() && igpu_device != nullptr) {
+        result.push_back(igpu_device);
+    }
+    return result;
+}
+
+static std::vector<ggml_backend_dev_t> server_target_fit_devices(const common_params & params) {
+    std::vector<ggml_backend_dev_t> devices = server_configured_devices(params);
+    if (params.split_mode != LLAMA_SPLIT_MODE_NONE) {
+        return devices;
+    }
+    if (params.main_gpu < 0 || (size_t) params.main_gpu >= devices.size()) {
+        return {};
+    }
+    return { devices[params.main_gpu] };
+}
+
+static server_shared_draft_device_config server_prepare_shared_draft_devices(const common_params & params) {
+    server_shared_draft_device_config result;
+    const auto & types = params.speculative.types;
+    const bool has_shared_draft =
+        std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end() ||
+        std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != types.end();
+    if (!has_shared_draft) {
+        return result;
+    }
+
+    const std::vector<ggml_backend_dev_t> target_devices = server_configured_devices(params);
+
+    const auto & draft_devices = params.speculative.draft.devices;
+    const bool automatic = draft_devices.empty();
+    const bool cpu_only = !automatic && draft_devices.front() == nullptr;
+
+    std::vector<ggml_backend_dev_t> weight_devices;
+    if (!automatic && !cpu_only) {
+        for (ggml_backend_dev_t device : draft_devices) {
+            if (device == nullptr) {
+                break;
+            }
+            if (std::find(weight_devices.begin(), weight_devices.end(), device) == weight_devices.end()) {
+                weight_devices.push_back(device);
+            }
+        }
+    }
+
+    if (automatic) {
+        if (target_devices.empty()) {
+            return result;
+        }
+
+        ggml_backend_dev_t target_primary = nullptr;
+        if (params.main_gpu >= 0) {
+            if (!params.devices.empty() && (size_t) params.main_gpu < params.devices.size()) {
+                target_primary = params.devices[params.main_gpu];
+            } else if (params.devices.empty() && (size_t) params.main_gpu < target_devices.size()) {
+                target_primary = target_devices[params.main_gpu];
+            }
+        }
+
+        ggml_backend_dev_t draft_primary = nullptr;
+        size_t draft_free = 0;
+        for (ggml_backend_dev_t device : target_devices) {
+            if (target_devices.size() > 1 && device == target_primary) {
+                continue;
+            }
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(device, &free, &total);
+            if (draft_primary == nullptr || free > draft_free) {
+                draft_primary = device;
+                draft_free = free;
+            }
+        }
+
+        GGML_ASSERT(draft_primary != nullptr);
+        weight_devices.push_back(draft_primary);
+        SRV_INF("[spec] auto-selected %s as the primary draft device\n", ggml_backend_dev_name(draft_primary));
+    }
+
+    result.devices = weight_devices;
+    size_t n_added = 0;
+    for (ggml_backend_dev_t device : target_devices) {
+        if (std::find(result.devices.begin(), result.devices.end(), device) == result.devices.end()) {
+            result.devices.push_back(device);
+            n_added++;
+        }
+    }
+    result.devices.push_back(nullptr);
+
+    result.prepared = true;
+    result.n_weight_devices = weight_devices.size();
+    result.tensor_split.resize(result.n_weight_devices, 0.0f);
+    if (result.n_weight_devices == 1) {
+        result.tensor_split[0] = 1.0f;
+    } else if (result.n_weight_devices > 1) {
+        bool has_user_split = false;
+        for (size_t i = 0; i < result.n_weight_devices; i++) {
+            result.tensor_split[i] = params.tensor_split[i];
+            has_user_split = has_user_split || result.tensor_split[i] != 0.0f;
+        }
+        if (!has_user_split) {
+            for (size_t i = 0; i < result.n_weight_devices; i++) {
+                size_t free = 0;
+                size_t total = 0;
+                ggml_backend_dev_memory(weight_devices[i], &free, &total);
+                result.tensor_split[i] = std::max(1.0f, (float) (free / (1024 * 1024)));
+            }
+        }
+    }
+
+    if (cpu_only && n_added > 0) {
+        SRV_INF("[spec] added %zu target device(s) to the CPU draft scheduler for shared tensors\n", n_added);
+    } else if (!automatic && n_added > 0) {
+        SRV_INF("[spec] added %zu target device(s) to the draft scheduler for shared tensors\n", n_added);
+    }
+    return result;
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -829,6 +1003,7 @@ private:
     // use server_context methods instead
 
     common_params params_base;
+    common_params params_load;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -961,18 +1136,38 @@ private:
         load_progress_data load_progress_spec  (this, "spec_model");
 
         const bool is_resume = sleeping;
+        if (!is_resume) {
+            params_load = params;
+        }
 
-        params_base = params;
+        params_base = params_load;
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
-        const bool has_mmproj = !params.mmproj.path.empty();
-        const bool has_draft = params.speculative.has_dft();
+        const bool has_mmproj = !params_base.mmproj.path.empty();
+        const bool has_draft = params_base.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+        const server_shared_draft_device_config shared_draft_devices = server_prepare_shared_draft_devices(params_base);
+
+        auto make_params_dft = [&]() {
+            common_params params_dft = common_base_params_to_speculative(params_base);
+            if (shared_draft_devices.prepared) {
+                params_dft.devices = shared_draft_devices.devices;
+                params_dft.main_gpu = 0;
+                params_dft.split_mode = LLAMA_SPLIT_MODE_LAYER;
+                std::fill(std::begin(params_dft.tensor_split), std::end(params_dft.tensor_split), 0.0f);
+                std::copy(shared_draft_devices.tensor_split.begin(), shared_draft_devices.tensor_split.end(),
+                          std::begin(params_dft.tensor_split));
+                if (shared_draft_devices.n_weight_devices == 0) {
+                    params_dft.n_gpu_layers = 0;
+                }
+            }
+            return params_dft;
+        };
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1024,13 +1219,13 @@ private:
                 }
                 SRV_TRC("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
                 GGML_ASSERT(!params_base.fit_params_target.empty());
+                const std::vector<ggml_backend_dev_t> target_fit_devices = server_target_fit_devices(params_base);
                 for (auto & [dev, size] : mmproj_mem) {
-                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                        if (ggml_backend_dev_get(i) == dev) {
-                            if (i < params_base.fit_params_target.size()) {
-                                SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
-                                params_base.fit_params_target[i] += size;
-                            }
+                    for (size_t i = 0; i < target_fit_devices.size(); i++) {
+                        if (target_fit_devices[i] == dev) {
+                            GGML_ASSERT(i < params_base.fit_params_target.size());
+                            SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
+                            params_base.fit_params_target[i] += size;
                             break;
                         }
                     }
@@ -1075,7 +1270,7 @@ private:
             load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
 
             {
-                common_params params_dft = common_base_params_to_speculative(params_base);
+                common_params params_dft = make_params_dft();
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
@@ -1301,8 +1496,10 @@ private:
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
 
-        // propagate new defaults back to caller
-        params = params_base;
+        // propagate new defaults back to the initial caller
+        if (!is_resume) {
+            params = params_base;
+        }
 
         if (!is_resume) {
             return init();
