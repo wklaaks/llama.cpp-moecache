@@ -728,6 +728,29 @@ public:
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
     }
 
+    // the idx cache pads n_kv like the attention cache, so the tensor shapes are stable
+    // across long stretches of decoding; without this override the default can_reuse
+    // returns false and the whole graph is rebuilt and re-recorded every token, which
+    // dominates decode wall time (measured: ~3.8 ms of GPU work inside a ~52 ms token)
+    bool can_reuse(const llm_graph_params & params) override {
+        const auto * mctx_new = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+
+        if (mctx_new->get_idx() == nullptr) {
+            return false;
+        }
+
+        mctx = mctx_new;
+
+        bool res = true;
+
+        res &= k_idxs->ne[0]   == (int64_t) params.ubatch.n_tokens;
+        res &= cell_blk->ne[0] == (int64_t) mctx_new->get_idx()->get_n_kv();
+        res &= cell_blk->ne[1] == (int64_t) mctx_new->get_n_stream();
+        res &= bias->ne[1] * bias->ne[2] == (int64_t) params.ubatch.n_tokens;
+
+        return res;
+    }
+
     // per stream: a cell index names a different token in each stream
     ggml_tensor * k_idxs    = nullptr;   // I32 [n_tokens]
     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
@@ -765,29 +788,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     GGML_ASSERT(n_tokens % n_stream == 0);
     const int64_t n_tps = n_tokens/n_stream;
 
-    // only the "which block is visible" half of the bias varies per block
-    // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
-    // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
-    // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
+    // only the "which block is visible" half of the bias varies per block; alibi/non-causal opt out
     const bool blk_bias = kq_mask != nullptr &&
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
 
-    auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
+    // the tables and bias depend only on the cells and the ubatch: every QSA layer in the
+    // graph shares one input, so the host fills them once per batch instead of once per layer
+    llm_graph_input_qsa * inp = (llm_graph_input_qsa *) qsa_shared;
+    if (inp == nullptr) {
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
 
-    qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-    qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-    qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
-    qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-    qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+        qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
+        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
-    ggml_set_input(qsa->cell_blk);
-    ggml_set_input(qsa->blk_cells);
-    ggml_set_input(qsa->blk_pos);
-    ggml_set_input(qsa->bias);
 
-    llm_graph_input_qsa * inp = qsa.get();
-    res->add_input(std::move(qsa));
+        ggml_set_input(qsa->cell_blk);
+        ggml_set_input(qsa->blk_cells);
+        ggml_set_input(qsa->blk_pos);
+        ggml_set_input(qsa->bias);
+
+        inp = qsa.get();
+        qsa_shared = inp;
+        res->add_input(std::move(qsa));
+    } else {
+        // the ratio is per-layer in the hparams but uniform in practice; sharing requires it
+        GGML_ASSERT(inp->ratio == (uint32_t) r && "QSA input sharing assumes a uniform compress ratio");
+    }
 
     // cached indexer keys are raw: pooling precedes norm and rotation, so apply neither
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
@@ -1246,6 +1276,12 @@ public:
     virtual ~llm_graph_input_ple() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+
+        return rows->ne[0] == (int64_t) (pmodel.hparams.ple_n_heads * params.ubatch.n_tokens);
+    }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
 
