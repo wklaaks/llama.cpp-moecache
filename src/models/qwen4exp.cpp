@@ -1278,7 +1278,9 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override {
-        mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+        const auto * mctx_new = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+        // the predecessor tokens live in the attention cells, so track the attention sub-cache
+        mctx = mctx_new->get_attn();
 
         return rows->ne[0] == (int64_t) (pmodel.hparams.ple_n_heads * params.ubatch.n_tokens);
     }
