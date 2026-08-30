@@ -2327,6 +2327,19 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
+        // [TAG_QSA_GATHER] ported from EngramHalo.cpp: gathered decode attention
+        int64_t qsa_gather_n_sel(int64_t n_kv, int64_t width) const;
+
+        ggml_tensor * build_attn_qsa_gather(
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * kq_mask,
+                ggml_tensor * q_cur,
+                ggml_tensor * top_k,
+                int64_t       width,
+                float         kq_scale,
+                int           il);
+
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
