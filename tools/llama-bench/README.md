@@ -75,8 +75,10 @@ test parameters:
   -dev, --device <dev0/dev1/...>            (default: auto)
   -lm, --load-mode <none|mmap|mlock|mmap+mlock|dio>
                                             (default: mmap)
+  -lzm, --lazy-mode <on|auto|off>           (default: auto)
   -mmp, --mmap <0|1>                        deprecated; use --load-mode
   -dio, --direct-io <0|1>                   deprecated; use --load-mode
+
   -embd, --embeddings <0|1>                 (default: 0)
   -ts, --tensor-split <ts0/ts1/..>          (default: 0)
   -ot --override-tensor <tensor name pattern>=<buffer type>;...
