@@ -17,6 +17,51 @@
 
 </div>
 
+## 🍴 About this fork — `wklaaks/llama.cpp-moecache`
+
+This is a feature branch of [llama.cpp](https://github.com/ggml-org/llama.cpp)
+focused on the **Qwen4Exp / Qwen3.8-Flash-Next** model family. It layers three
+capabilities on top of current upstream (merged through PR #27742), none of which
+are available in stock llama.cpp:
+
+1. **MoE expert hot-cache (VRAM).** Keeps the most-recently-used MoE expert
+   weights resident in GPU memory instead of re-streaming them from host on every
+   token. For large Mixture-of-Experts models this removes the dominant
+   decode-time memory-bandwidth bottleneck and substantially raises tokens/sec
+   at the cost of a bounded VRAM budget.
+2. **Native MTP / NextN speculative decoding.** A first-class draft-model path for
+   Multi-Token-Prediction heads (`--spec-type draft-mtp`, `-md <sidecar.gguf>`).
+   The converter can emit a compact MTP *sidecar* GGUF from the Hugging Face
+   safetensors source — see below.
+3. **Graph reuse + QSA fixes.** Enables CUDA graph reuse for the qwen4exp decode
+   path and shares the sparse-attention (QSA) input across layers, plus assorted
+   correctness/perf fixes to the indexer and PLE caches.
+
+### Build the MTP sidecar
+
+A self-contained helper lives in [`tools/mtp-sidecar/`](tools/mtp-sidecar/) —
+it downloads **only** the MTP/nextn tensors from a Hugging Face safetensors
+model (HTTP Range reads, no full-model download), checks disk space, runs this
+repo's `convert_hf_to_gguf.py --mtp --remote`, and validates the resulting
+sidecar GGUF:
+
+```bash
+./tools/mtp-sidecar/make_mtp_sidecar.py Qwen/Qwen3.8-Flash-Next \
+    --out-dir ~/models --fork-dir "$(pwd)"
+```
+
+Then serve with the sidecar as the draft model:
+
+```bash
+./build/bin/llama-server -m <base.gguf> -md mtp-Qwen3.8-Flash-Next-Q8_0.gguf \
+    --spec-type draft-mtp --spec-draft-n-max 3
+```
+
+Full instructions, options, and troubleshooting:
+[`tools/mtp-sidecar/README.md`](tools/mtp-sidecar/README.md).
+
+---
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
