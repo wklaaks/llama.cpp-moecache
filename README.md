@@ -39,7 +39,8 @@ are available in stock llama.cpp:
    safetensors source — see below.
 3. **Graph reuse + QSA fixes.** Enables CUDA graph reuse for the qwen4exp decode
    path and shares the sparse-attention (QSA) input across layers, plus assorted
-   correctness/perf fixes to the indexer and PLE caches.
+   correctness/perf fixes to the indexer and PLE caches. (See [QSA — native sparse
+   attention](#qsa--native-sparse-attention).)
 
 ### Build the MTP sidecar
 
@@ -188,6 +189,69 @@ MoE cache mode disables weight repacking*). `auto` preserves repacking, but a re
 cannot use the cache — so for a CPU-MoE + hot-cache deployment, `on` is the correct mode: it hands
 the cache the whole safe slab **and** keeps the weights in the layout the cache needs to read them.
 
+## QSA — native sparse attention
+
+Qwen4Exp is **not** a plain dense-attention model. Every 4th layer (layer indices
+`3, 7, 11, …, 47` — 12 of the 48 layers) uses **QSA (Qwen Sparse Attention)**: a
+*learned* content-based key selection that bounds the attention matmul regardless
+of context length. The remaining 36 layers are fully dense.
+
+This is baked into the model weights — each sparse layer ships learned indexer
+tensors (`index_q_proj`, `index_k_proj`, `index_q_norm`, `index_k_norm`). From the
+GGUF metadata of `Qwen3.8-Flash-Next`:
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `attention.indexer.top_k` | `2048` | max number of **tokens** attended per query token |
+| `attention.indexer.head_count` | `4` | indexer heads |
+| `attention.indexer.key_length` | `128` | indexer key dim |
+| `attention.compress_ratios` | `[0,0,0,4]` × 12 | which layers are sparse (ratio 4) |
+
+### How it breaks linear context growth
+
+In a dense layer, attention is `Q·Kᵀ` over **all** `n_kv` keys — cost grows
+linearly with context. In a QSA layer the indexer first pools each group of
+`compress_ratio` (=4) tokens into a single *block score*, broadcasts that score to
+every token in the block, then keeps only the top **`top_k` (2048) tokens** — cut
+on a block boundary, plus the incomplete tail. From `src/models/qwen4exp.cpp`:
+
+```cpp
+// the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+```
+
+So in those 12 layers the expensive attention matmul is **capped at ~2048 tokens
+(≈512 blocks of 4) no matter how long the context gets**. At 151k context you are
+*not* doing 151k-key attention in the sparse layers — you are doing ~2k-token
+attention. This is the "only a subset of past tokens comes into play" behaviour:
+it is neither a sliding window nor an attention sink, but a *learned* selection
+(the indexer decides **which** tokens matter, not just the most recent N).
+
+### What it does and does not save
+
+- **Saves compute.** Attention FLOPs in the 12 sparse layers stop scaling with
+  context. `LLAMA_QSA_GATHER=1` forces the gather fast-path (attend only the
+  selected rows, padded to 256) on at all context lengths instead of the default
+  32k threshold.
+- **Does not save KV memory.** The indexer must score *every* block to pick the
+  top-2048 tokens, so all K/V rows stay resident in the KV cache. You cannot drop
+  old KV because QSA won't attend to it — the selection is dynamic and
+  non-monotonic, so any token can be re-selected later. To free KV VRAM use
+  quantized KV (`--cache-type-k/v q8_0`) or CPU-offloaded KV
+  (`--no-kv-offload`), not QSA.
+- **Pooled block-summary cache.** Complete blocks' indexer summaries are cached
+  and only the *dirty* (new) blocks are re-pooled each step
+  (`LLAMA_QSA_NO_POOLED_CACHE`), shrinking the small 128-dim indexer working set.
+
+### Synergy with the MoE expert hot-cache
+
+QSA shifts the per-token bottleneck from attention to the **MoE experts**. Once
+the 12 sparse layers stop paying full-context attention cost, the remaining GPU
+time is dominated by the FFN/expert path — exactly what `--moe-cache on`
+optimises. The two features compound: QSA frees GPU cycles that would otherwise
+go to attention, and those cycles now land on the experts, making the hot-cache's
+VRAM-resident working set more valuable. Serving with both enabled (as in the
+example above) is the intended configuration for this model family.
 ---
 
 ## Quick start
