@@ -135,7 +135,52 @@ ionice -c2 -n0 env \
 |----------|---------|--------|
 | `LLAMA_QSA_GATHER` | `32768` | Minimum KV length for the sparse-attention decode gather fast path. `1` = always on; `0` = always off; `<int>` = custom threshold. |
 | `GGML_CUDA_MOE_CACHE_RESERVE_MB` | `3072` | Per-device **OOM headroom** (MiB): free VRAM the cache leaves untouched so KV cache/activations are never starved. The cache may only spend `(free VRAM − reserve)`. Raise to protect against OOM crashes; lower to give the cache more room. |
+| `GGML_CUDA_MOE_CACHE_BUDGET_MB` | `0` (no cap) | Hard ceiling (MiB) on how much of the available slab the cache may claim. `0` = no explicit cap — it self-sizes to all of `(free VRAM − reserve)`. Equivalent to passing `--moe-cache <N>`. |
 | `GGML_CUDA_MOE_CACHE_STATS` | `0` (off) | Log MoE-cache hit-rate/budget stats every N collect cycles. Diagnostics only. |
+
+### How `--moe-cache`, the budget, and the reserve interact
+
+Three independent knobs control how much VRAM the MoE hot-cache actually occupies. Getting their
+roles straight matters, because two of them look alike but do opposite things:
+
+- **The *pool* it draws from** — the device's current **free VRAM**, which changes as the KV cache
+  grows and activations come and go.
+- **`GGML_CUDA_MOE_CACHE_RESERVE_MB`** (headroom) — subtracted *first*. This slice is left
+  **untouched** so the rest of the runtime is never starved into an OOM crash.
+- **`--moe-cache <N>` / `GGML_CUDA_MOE_CACHE_BUDGET_MB`** (cap) — applied *second*, as a ceiling on
+  whatever is left.
+
+So the cache claims, per cycle:
+
+```
+claim = min( (free_VRAM − reserve_mb), budget_mb )   # then split across participants
+```
+
+What each setting of `--moe-cache` means:
+
+| `--moe-cache` value | `budget_mb` | Result |
+|---------------------|-------------|--------|
+| *(not passed)*      | `0`         | **`auto`**: enabled, self-sizing, **no cap** — fills all of `(free VRAM − reserve)`. |
+| `on`                | `0`         | Same self-sizing as above, **plus** weight repacking is disabled (see below). |
+| `auto`              | `0`         | Explicitly the default behaviour. |
+| `off` / `0`         | —           | Cache disabled entirely. |
+| `<N>`               | `N`         | Self-sizing **capped at `N` MiB** per device. |
+
+Because no flag defaults to `auto`, **omitting `--moe-cache` still enables the cache** — it just
+also keeps weight repacking on.
+
+**Why we use `--moe-cache on` here.** With `--cpu-moe` the full expert set lives in system RAM and
+the cache streams the hottest experts up to a bounded VRAM slab. `on` gives us exactly that
+self-sizing slab (all free VRAM minus the 2500 MiB headroom) **and** forces **canonical
+(un-repacked) weights**.
+
+That second part is not optional polish — it is a hard requirement. The hot-cache locates and copies
+expert rows out of the weights' **stock dense layout**; repacked weights use a different physical
+arrangement, so a repacked model simply cannot be served by the cache. For that reason the runtime
+rejects `repack=on` whenever the cache is in `on` or fixed-`<N>` mode (`common/arg.cpp`: *explicit
+MoE cache mode disables weight repacking*). `auto` preserves repacking, but a repacked model then
+cannot use the cache — so for a CPU-MoE + hot-cache deployment, `on` is the correct mode: it hands
+the cache the whole safe slab **and** keeps the weights in the layout the cache needs to read them.
 
 ---
 
