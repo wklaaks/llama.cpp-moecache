@@ -28,7 +28,11 @@ are available in stock llama.cpp:
    weights resident in GPU memory instead of re-streaming them from host on every
    token. For large Mixture-of-Experts models this removes the dominant
    decode-time memory-bandwidth bottleneck and substantially raises tokens/sec
-   at the cost of a bounded VRAM budget.
+   at the cost of a bounded VRAM budget. It is a *read-through* cache: with
+   `--cpu-moe` the full expert set lives in system RAM as the immutable source of
+   truth, and the GPU slab holds only a copy of the hottest rows. Evicting a cold
+   row simply frees its GPU slot (no write-back to host); if it becomes hot again
+   it is re-copied on the next miss.
 2. **Native MTP / NextN speculative decoding.** A first-class draft-model path for
    Multi-Token-Prediction heads (`--spec-type draft-mtp`, `-md <sidecar.gguf>`).
    The converter can emit a compact MTP *sidecar* GGUF from the Hugging Face
