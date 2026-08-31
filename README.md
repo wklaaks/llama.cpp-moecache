@@ -62,6 +62,83 @@ Full instructions, options, and troubleshooting:
 
 ---
 
+## Serving
+
+Production serve command for the Qwen3.8-Flash-Next model family with MoE hot-cache
+and MTP speculative decoding:
+
+```bash
+ionice -c2 -n0 env \
+  LLAMA_QSA_GATHER=1 \
+  GGML_CUDA_MOE_CACHE_RESERVE_MB=2500 \
+  /home/keithl/src/llama.cpp-qwen4exp/build/bin/llama-server \
+  -m /media/keithl/m2a/qwenfn/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
+  -md /media/keithl/m2a/qwenfn/mtp-Qwen3.8-Flash-Next-Q8_0.gguf \
+  --alias Qwen3.8-Flash-Next \
+  --mlock \
+  -b 4096 -ub 2048 \
+  --threads 64 \
+  --threads-batch 48 \
+  --threads-http 4 \
+  --mmap \
+  --cache-prompt \
+  --slot-save-path /media/keithl/m2b/CACHE/Qwen3.8-Flash-Next \
+  --cache-ram 32000 \
+  --ctx-size 151000 \
+  --device CUDA0 \
+  --split-mode layer \
+  --moe-cache on \
+  --cpu-moe \
+  --n-gpu-layers 999 \
+  --spec-type draft-mtp \
+  --spec-draft-n-max 5 \
+  --device-draft CUDA0 \
+  --n-gpu-layers-draft 99 \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --jinja \
+  --reasoning-format deepseek \
+  --reasoning on \
+  --chat-template-kwargs '{"reasoning_effort":"low"}' \
+  --reasoning-preserve \
+  --reasoning-budget -1 \
+  --temp 0.7 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence_penalty 0.0 \
+  --parallel 1 \
+  --slots \
+  --cont-batching \
+  --verbose \
+  -lv 5 \
+  --port ${PORT}
+```
+
+### Key flags explained
+
+| Flag | Purpose |
+|------|---------|
+| `--cpu-moe` | Keeps **all** MoE expert weights in CPU RAM (not VRAM). Frees a large amount of VRAM on MoE models where experts dominate weight size. |
+| `--moe-cache on` | Adaptively caches the hottest CPU-resident MoE experts into a bounded VRAM slab so repeated hits avoid the PCIe round-trip. Combined with `--cpu-moe`: full expert set stays in RAM, working set gets GPU speed. |
+| `--spec-type draft-mtp` | Enables the native MTP (Multi-Token-Prediction) speculative-decoding path. |
+| `-md <sidecar>` | The MTP sidecar GGUF (built via `tools/mtp-sidecar/make_mtp_sidecar.py`). |
+| `--spec-draft-n-max 5` | Max tokens to draft per step. |
+| `--n-gpu-layers 999` | Offload all layers to GPU (non-expert weights). |
+| `--flash-attn on` | Required for the QSA gather fast path and generally faster attention. |
+| `--cache-type-k/v q8_0` | Quantized KV cache — halves VRAM vs F16 at negligible quality loss. |
+
+### Env vars
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `LLAMA_QSA_GATHER` | `32768` | Minimum KV length for the sparse-attention decode gather fast path. `1` = always on; `0` = always off; `<int>` = custom threshold. |
+| `GGML_CUDA_MOE_CACHE_RESERVE_MB` | `3072` | Per-device VRAM slab (MiB) reserved for the MoE hot-cache. Lower to free VRAM for KV cache/activations. |
+| `GGML_CUDA_MOE_CACHE_STATS` | `0` (off) | Log MoE-cache hit-rate/budget stats every N collect cycles. Diagnostics only. |
+
+---
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
