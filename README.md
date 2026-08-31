@@ -71,9 +71,9 @@ and MTP speculative decoding:
 ionice -c2 -n0 env \
   LLAMA_QSA_GATHER=1 \
   GGML_CUDA_MOE_CACHE_RESERVE_MB=2500 \
-  /home/keithl/src/llama.cpp-qwen4exp/build/bin/llama-server \
-  -m /media/keithl/m2a/qwenfn/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
-  -md /media/keithl/m2a/qwenfn/mtp-Qwen3.8-Flash-Next-Q8_0.gguf \
+  ~/llama.cpp-moecache/build/bin/llama-server \
+  -m ~/models/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
+  -md ~/models/mtp-Qwen3.8-Flash-Next-Q8_0.gguf \
   --alias Qwen3.8-Flash-Next \
   --mlock \
   -b 4096 -ub 2048 \
@@ -82,7 +82,7 @@ ionice -c2 -n0 env \
   --threads-http 4 \
   --mmap \
   --cache-prompt \
-  --slot-save-path /media/keithl/m2b/CACHE/Qwen3.8-Flash-Next \
+  --slot-save-path ~/cache/Qwen3.8-Flash-Next \
   --cache-ram 32000 \
   --ctx-size 151000 \
   --device CUDA0 \
