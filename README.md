@@ -128,6 +128,8 @@ ionice -c2 -n0 env \
 | `--n-gpu-layers 999` | Offload all layers to GPU (non-expert weights). |
 | `--flash-attn on` | Required for the QSA gather fast path and generally faster attention. |
 | `--cache-type-k/v q8_0` | Quantized KV cache — halves VRAM vs F16 at negligible quality loss. |
+| `--verbose` (`-v`) | Alias for `-lv INT_MAX`: log **everything** including per-token debug traces. Use only when diagnosing a specific bug. |
+| `-lv 5` (`--log-verbosity`) | Numeric verbosity threshold (default `3`). Messages at or below this level are printed; higher are suppressed. Levels: `0`=generic, `1`=error, `2`=warning, `3`=info, `4`=trace, `5`=debug. Unlike `--verbose` (which is all-or-nothing), `-lv N` gives a graduated dial. |
 
 ### Env vars
 
