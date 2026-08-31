@@ -134,7 +134,7 @@ ionice -c2 -n0 env \
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `LLAMA_QSA_GATHER` | `32768` | Minimum KV length for the sparse-attention decode gather fast path. `1` = always on; `0` = always off; `<int>` = custom threshold. |
-| `GGML_CUDA_MOE_CACHE_RESERVE_MB` | `3072` | Per-device VRAM slab (MiB) reserved for the MoE hot-cache. Lower to free VRAM for KV cache/activations. |
+| `GGML_CUDA_MOE_CACHE_RESERVE_MB` | `3072` | Per-device **OOM headroom** (MiB): free VRAM the cache leaves untouched so KV cache/activations are never starved. The cache may only spend `(free VRAM − reserve)`. Raise to protect against OOM crashes; lower to give the cache more room. |
 | `GGML_CUDA_MOE_CACHE_STATS` | `0` (off) | Log MoE-cache hit-rate/budget stats every N collect cycles. Diagnostics only. |
 
 ---
