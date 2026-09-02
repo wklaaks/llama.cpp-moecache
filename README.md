@@ -62,6 +62,15 @@ Then serve with the sidecar as the draft model:
     --spec-type draft-mtp --spec-draft-n-max 3
 ```
 
+> **Both sidecar tensor schemes are supported.** The runtime auto-detects whether
+> a sidecar uses the *split* combiner (`nextn.fc_embd` + `nextn.fc_hidden`, as
+> emitted by `make_mtp_sidecar.py`) or the *fused* combiner (`nextn.eh_proj`,
+> shape `[2*n_embd, n_embd]`, as shipped in pre-converted GGUFs such as
+> Unsloth's `mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`). The two forms are
+> mathematically equivalent — `eh_proj @ concat(e, h) == W_e@e + W_h@h` — so
+> either file loads with the same `-md` flag; no extra configuration is needed.
+> (Likewise for the hyper-connection mixer: `hc_*` or `hc_head_*` tensors.)
+
 Full instructions, options, and troubleshooting:
 [`tools/mtp-sidecar/README.md`](tools/mtp-sidecar/README.md).
 

@@ -31,6 +31,20 @@ llama-server -m <base.gguf> -md mtp-<name>.gguf \
              --spec-type draft-mtp --spec-draft-n-max 3
 ```
 
+> **Pre-built sidecars from other publishers also work.** The fork's runtime
+> accepts *both* MTP combiner layouts:
+>
+> | Scheme | Combiner tensors | Mixer tensors | Source |
+> |--------|------------------|---------------|--------|
+> | split  | `nextn.fc_embd` + `nextn.fc_hidden` (each `[n_embd, n_embd]`) | `nextn.hc_norm/down/up` | this tool (`make_mtp_sidecar.py`) |
+> | fused  | `nextn.eh_proj` (`[2*n_embd, n_embd]`) | `nextn.hc_head_norm/down/up` | e.g. Unsloth's `mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf` |
+>
+> Both are algebraically identical (`eh_proj @ concat(e,h) == W_e@e + W_h@h`);
+> the loader marks all six tensors optional and the graph picks the path that
+> matches whichever tensors the GGUF actually contains. A `check_tensor_dims:
+> tensor 'blk.N.nextn.fc_embd.weight' not found` error means you are running a
+> binary *without* the dual-scheme loader — rebuild from this fork.
+
 ---
 
 ## Why it only downloads a fraction
