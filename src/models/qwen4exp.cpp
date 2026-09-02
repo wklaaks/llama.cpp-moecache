@@ -242,13 +242,19 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", il), { idx_dim }, mf | TENSOR_NOT_REQUIRED);
         }
 
-        layer.nextn.fc_embd   = create_tensor(tn(LLM_TENSOR_NEXTN_FC_EMBD,   "weight", il), { n_embd, n_embd }, mf);
-        layer.nextn.fc_hidden = create_tensor(tn(LLM_TENSOR_NEXTN_FC_HIDDEN, "weight", il), { n_embd, n_embd }, mf);
+        // Dual-scheme combiner: eh_proj (fused, Unsloth) OR fc_embd+fc_hidden (split, ours)
+        layer.nextn.eh_proj   = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,   "weight", il), { 2 * n_embd, n_embd }, mf | TENSOR_NOT_REQUIRED);
+        layer.nextn.fc_embd   = create_tensor(tn(LLM_TENSOR_NEXTN_FC_EMBD,   "weight", il), { n_embd, n_embd }, mf | TENSOR_NOT_REQUIRED);
+        layer.nextn.fc_hidden = create_tensor(tn(LLM_TENSOR_NEXTN_FC_HIDDEN, "weight", il), { n_embd, n_embd }, mf | TENSOR_NOT_REQUIRED);
         layer.nextn.enorm     = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,     "weight", il), { n_embd }, mf);
         layer.nextn.hnorm     = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,     "weight", il), { hc_dim }, mf);
-        layer.nextn.hc_norm   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_NORM,   "weight", il), { hc_dim }, mf);
-        layer.nextn.hc_down   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_DOWN,   "weight", il), { hc_dim, hc_lr }, mf);
-        layer.nextn.hc_up     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_UP,     "weight", il), { hc_lr, hc_dim }, mf);
+        // Dual-scheme head mixer: hc_head_* (Unsloth) OR hc_* (ours)
+        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, mf | TENSOR_NOT_REQUIRED);
+        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, mf | TENSOR_NOT_REQUIRED);
+        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, mf | TENSOR_NOT_REQUIRED);
+        layer.nextn.hc_norm   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_NORM,   "weight", il), { hc_dim }, mf | TENSOR_NOT_REQUIRED);
+        layer.nextn.hc_down   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_DOWN,   "weight", il), { hc_dim, hc_lr }, mf | TENSOR_NOT_REQUIRED);
+        layer.nextn.hc_up     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_UP,     "weight", il), { hc_lr, hc_dim }, mf | TENSOR_NOT_REQUIRED);
     }
 }
 
@@ -277,11 +283,16 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     const int il = hparams.n_layer();
     const auto & layer = model.layers[il];
 
-    GGML_ASSERT(layer.nextn.fc_embd   && "MTP block missing nextn.fc_embd");
-    GGML_ASSERT(layer.nextn.fc_hidden && "MTP block missing nextn.fc_hidden");
-    GGML_ASSERT(layer.nextn.enorm     && "MTP block missing nextn.enorm");
-    GGML_ASSERT(layer.nextn.hnorm     && "MTP block missing nextn.hnorm");
-    GGML_ASSERT(layer.nextn.hc_norm   && "MTP block missing nextn.hc_norm");
+    // Dual-scheme combiner: eh_proj (fused, Unsloth) OR fc_embd+fc_hidden (split, ours)
+    const bool mtp_has_eh_proj = layer.nextn.eh_proj != nullptr;
+    GGML_ASSERT((mtp_has_eh_proj || (layer.nextn.fc_embd && layer.nextn.fc_hidden)) &&
+               "MTP block missing nextn combiner (need eh_proj or fc_embd+fc_hidden)");
+    GGML_ASSERT(layer.nextn.enorm && "MTP block missing nextn.enorm");
+    GGML_ASSERT(layer.nextn.hnorm && "MTP block missing nextn.hnorm");
+    // Dual-scheme head mixer: hc_head_* (Unsloth) OR hc_* (ours)
+    const bool mtp_has_hc_head = layer.nextn.hc_head_norm != nullptr;
+    GGML_ASSERT((mtp_has_hc_head || layer.nextn.hc_norm) &&
+               "MTP block missing nextn head mixer (need hc_head_* or hc_*)");
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -371,28 +382,49 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     };
 
     // -- combiner --------------------------------------------------------
+    // Two equivalent formulations:
+    //   split:  fc_embd@e + fc_hidden@h  (our original sidecar)
+    //   fused:  eh_proj @ concat(e, h)   (Unsloth / upstream scheme)
+    // Both produce [n_embd, hc, T]: per-stream residual with the embedding path
+    // broadcast into every stream.
 
-    ggml_tensor * e = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
-    e = build_lora_mm(layer.nextn.fc_embd, e);
-    cb(e, "mtp_fc_embd", il);
+    ggml_tensor * res_hc;
+    if (mtp_has_eh_proj) {
+        // Fused path: single matmul over the stacked [e; h] input
+        ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+        e_norm = ggml_repeat_4d(ctx0,
+                ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens),
+                n_embd, hc, n_tokens, 1);
+        cb(e_norm, "mtp_enorm", il);
 
-    // combiner variant B: keep the per-stream structure of the target's widened residual.
-    // fc_hidden is applied to each stream independently (it is [n_embd, n_embd]) and the
-    // embedding path is broadcast into every stream, so the hc streams stay distinct -
-    // collapsing them by mean first (DeepSeek-style) threw that information away and
-    // measured lower draft acceptance.
-    ggml_tensor * hn = grouped_norm(h_wide, layer.nextn.hnorm);
-    ggml_tensor * hs = ggml_reshape_2d(ctx0, hn, n_embd, hc * n_tokens);
-    hs = build_lora_mm(layer.nextn.fc_hidden, hs);
-    hs = ggml_reshape_3d(ctx0, hs, n_embd, hc, n_tokens);
-    cb(hs, "mtp_fc_hidden", il);
+        ggml_tensor * h_norm = grouped_norm(h_wide, layer.nextn.hnorm);
+        h_norm = ggml_reshape_3d(ctx0, h_norm, n_embd, hc, n_tokens);
+        cb(h_norm, "mtp_hnorm", il);
 
-    ggml_tensor * e_wide = ggml_repeat_4d(ctx0,
-            ggml_reshape_3d(ctx0, e, n_embd, 1, n_tokens),
-            n_embd, hc, n_tokens, 1);
+        ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
+        cb(concat, "mtp_concat", il);
 
-    ggml_tensor * res_hc = ggml_add(ctx0, hs, e_wide);
-    cb(res_hc, "mtp_hc_init", il);
+        res_hc = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
+        cb(res_hc, "mtp_eh_proj", il);
+    } else {
+        // Split path (combiner variant B): keep per-stream structure
+        ggml_tensor * e = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+        e = build_lora_mm(layer.nextn.fc_embd, e);
+        cb(e, "mtp_fc_embd", il);
+
+        ggml_tensor * hn = grouped_norm(h_wide, layer.nextn.hnorm);
+        ggml_tensor * hs = ggml_reshape_2d(ctx0, hn, n_embd, hc * n_tokens);
+        hs = build_lora_mm(layer.nextn.fc_hidden, hs);
+        hs = ggml_reshape_3d(ctx0, hs, n_embd, hc, n_tokens);
+        cb(hs, "mtp_fc_hidden", il);
+
+        ggml_tensor * e_wide = ggml_repeat_4d(ctx0,
+                ggml_reshape_3d(ctx0, e, n_embd, 1, n_tokens),
+                n_embd, hc, n_tokens, 1);
+
+        res_hc = ggml_add(ctx0, hs, e_wide);
+        cb(res_hc, "mtp_hc_init", il);
+    }
 
     // -- attention (dense; the draft context carries no indexer cache) ---
 
@@ -494,8 +526,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->t_h_nextn = h_next;
 
     // the head's own mixer is its output norm, as in the trunk
-    ggml_tensor * final = hc_mix(res_hc, layer.nextn.hc_norm, layer.nextn.hc_down,
-                                 layer.nextn.hc_up, nullptr, nullptr);
+    // dual-scheme: hc_head_* (Unsloth) OR hc_* (ours)
+    ggml_tensor * hm_norm = mtp_has_hc_head ? layer.nextn.hc_head_norm : layer.nextn.hc_norm;
+    ggml_tensor * hm_down = mtp_has_hc_head ? layer.nextn.hc_head_down : layer.nextn.hc_down;
+    ggml_tensor * hm_up   = mtp_has_hc_head ? layer.nextn.hc_head_up   : layer.nextn.hc_up;
+    ggml_tensor * final = hc_mix(res_hc, hm_norm, hm_down, hm_up, nullptr, nullptr);
     cb(final, "mtp_head_mix", il);
 
     if (inp_out_ids) {
@@ -942,9 +977,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream));
     score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
     score = ggml_relu(ctx0, score);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
-    score = ggml_sum_rows(ctx0, score);
-    score = ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream);
+
+    // the heads sit side by side on ne[1] and there are only a few of them
+    ggml_tensor * summed = nullptr;
+    for (int64_t h = 0; h < n_idx_h; ++h) {
+        ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
+                score->nb[2], score->nb[3], h*score->nb[1]);
+        summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+    }
+
+    score = summed;
     cb(score, "indexer_score", il);
 
     // one value per block, so it is cheaper to bias here than after the cells are expanded
